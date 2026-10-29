@@ -1,0 +1,43 @@
+[package]
+name    = "esp-doom"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+allocator-api2          = { version = "0.3.0", default-features = false, features = ["alloc"] }
+critical-section        = "1"
+embassy-executor        = "0.10.0"
+embassy-time            = "0.5.0"
+embedded-graphics       = "0.8.1"
+esp-alloc               = { version = "0.11.0", features = ["esp32s31"] }
+esp-backtrace           = { version = "0.20.0", features = ["esp32s31", "panic-handler", "println"] }
+esp-bootloader-esp-idf  = { version = "0.6.0", features = ["esp32s31"] }
+esp-hal                 = { version = "1.2.0", features = ["esp32s31", "log-04", "unstable"] }
+esp-println             = { version = "0.18.0", features = ["esp32s31", "log-04"] }
+esp-rtos                = { version = "0.4.0", features = ["embassy", "esp32s31", "log-04"] }
+miniz_oxide             = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
+neurodoom               = { version = "0.6.7", default-features = false }
+static_cell             = "2.1.1"
+
+[build-dependencies]
+miniz_oxide = "0.8.9"
+
+# The ESP32-S31 LCD driver is not released yet. This esp-hal revision is from 2026-10-15.
+[patch.crates-io]
+esp-alloc              = { git = "https://github.com/esp-rs/esp-hal", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1" }
+esp-backtrace          = { git = "https://github.com/esp-rs/esp-hal", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1" }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1" }
+esp-hal                = { git = "https://github.com/esp-rs/esp-hal", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1" }
+esp-println            = { git = "https://github.com/esp-rs/esp-hal", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1" }
+esp-rtos               = { git = "https://github.com/esp-rs/esp-hal", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1" }
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+codegen-units    = 1
+debug            = true
+debug-assertions = false
+lto              = "fat"
+opt-level        = 3
