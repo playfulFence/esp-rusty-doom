@@ -2,24 +2,37 @@
 //! the screen palette.
 
 use alloc::{boxed::Box, format, string::String, vec::Vec};
+use core::alloc::Layout;
 
+use allocator_api2::alloc::Allocator;
+use embassy_time::{Duration, Instant};
+use esp_alloc::InternalMemory;
 use esp_println::println;
 use neurodoom::{
     AmmoType,
     Button,
     Buttons,
     ClassicEngine,
+    Fixed,
     LevelExit,
     PeerId,
     PlayerAction,
     WeaponType,
 };
 
-use crate::{canvas::rgb565, controls::Input};
+use crate::{
+    canvas::rgb565,
+    controls::Input,
+    mailbox::{self, Picture},
+};
 
 const PLAYER: PeerId = PeerId(0);
 const FIRST_MAP: &str = "E1M1";
-pub const TICRATE: u32 = 35;
+const TICRATE: u32 = 35;
+const TIC: Duration = Duration::from_micros(1_000_000 / TICRATE as u64);
+/// When rendering falls behind, the game runs at most this many tics per picture
+/// and then slows down.
+const MAX_TICS_PER_FRAME: u32 = 3;
 
 /// The order in which the weapon button goes through the weapons. The super shotgun
 /// is only in Doom II, and the engine can't select it.
@@ -65,14 +78,17 @@ pub struct Game {
 
 impl Game {
     pub fn new(wad: &'static [u8]) -> Self {
-        let engine = Box::new(ClassicEngine::new(wad, FIRST_MAP).expect("cannot load the WAD"));
+        let mut engine = Box::new(ClassicEngine::new(wad, FIRST_MAP).expect("cannot load the WAD"));
+        // The firmware draws the indexed picture. Without an RGBA buffer, the engine
+        // skips its RGBA conversion.
+        engine.renderer_mut().rgba = Vec::new();
         let palettes = engine
             .textures()
             .palettes
             .iter()
             .map(|palette| {
                 let mut colors = [0u16; 256];
-                for (color, rgb) in colors.iter_mut().zip(palette.chunks_exact(3)) {
+                for (color, rgb) in colors.iter_mut().zip(palette.as_chunks::<3>().0) {
                     *color = rgb565(rgb[0], rgb[1], rgb[2]);
                 }
                 colors
@@ -92,12 +108,56 @@ impl Game {
         }
     }
 
+    /// Moves the renderer's depth buffer to internal RAM, which is faster than PSRAM.
+    /// The depth buffer gets the most writes: 4 bytes for each pixel of each frame.
+    pub fn move_depth_buffer_to_internal_ram(&mut self) {
+        let renderer = self.engine.renderer_mut();
+        let len = renderer.depth.len();
+        let allocation = InternalMemory
+            .allocate_zeroed(Layout::array::<Fixed>(len).unwrap())
+            .expect("internal RAM allocation failed");
+        // SAFETY: zero bytes are valid `Fixed` values. The global allocator frees the
+        // allocation like any other, because both allocators use the same heap.
+        renderer.depth =
+            unsafe { Vec::from_raw_parts(allocation.cast::<Fixed>().as_ptr(), len, len) };
+    }
+
     pub fn map_name(&self) -> &str {
         &self.map
     }
 
+    /// Runs the game forever: steps it 35 times per second, and posts a picture after
+    /// each step or group of steps.
+    pub fn run(mut self) -> ! {
+        let mut next_tic = Instant::now();
+        loop {
+            let now = Instant::now();
+            if now < next_tic {
+                continue;
+            }
+            let mut ran = 0;
+            while next_tic <= now && ran < MAX_TICS_PER_FRAME {
+                let input = mailbox::take_input();
+                if input.next_weapon {
+                    self.next_weapon();
+                }
+                self.tic(&input);
+                next_tic += TIC;
+                ran += 1;
+            }
+            if next_tic <= now {
+                next_tic = now + TIC;
+            }
+            self.render();
+            mailbox::post_picture(|picture| {
+                self.fill_picture(picture);
+                picture.game_time = now.elapsed();
+            });
+        }
+    }
+
     /// Runs one 1/35 s step of the game.
-    pub fn tic(&mut self, input: &Input) {
+    fn tic(&mut self, input: &Input) {
         let pressed = input.fire || input.use_;
         if self.status().is_none_or(|status| status.health <= 0) {
             self.dead_tics += 1;
@@ -134,17 +194,22 @@ impl Game {
     }
 
     /// Draws the player's view into the indexed screen buffer.
-    pub fn render(&mut self) {
+    fn render(&mut self) {
         self.engine.render_for(PLAYER);
     }
 
-    /// The last rendered picture, one palette index per pixel.
-    pub fn screen(&self) -> &[u8] {
-        &self.engine.renderer().screen
+    /// Copies the last rendered picture and what the HUD needs.
+    fn fill_picture(&self, picture: &mut Picture) {
+        picture
+            .screen
+            .copy_from_slice(&self.engine.renderer().screen);
+        picture.palette = *self.palette();
+        picture.status = self.status();
+        picture.map.clone_from(&self.map);
     }
 
     /// The palette for the picture, with the damage and pickup flashes.
-    pub fn palette(&self) -> &[u16; 256] {
+    fn palette(&self) -> &[u16; 256] {
         let index = if self.damage_count > 0 {
             DAMAGE_PALETTES + ((self.damage_count + 7) / 8).clamp(1, 8) as usize - 1
         } else if self.bonus_count > 0 {
@@ -155,7 +220,7 @@ impl Game {
         self.palettes.get(index).unwrap_or(&self.palettes[0])
     }
 
-    pub fn status(&self) -> Option<Status> {
+    fn status(&self) -> Option<Status> {
         let world = self.engine.world();
         let player = world.controlled_by(PLAYER)?;
         let health = world.get(player)?.health;
@@ -168,7 +233,7 @@ impl Game {
     }
 
     /// Starts switching to the next weapon that the player has, with ammo.
-    pub fn next_weapon(&mut self) {
+    fn next_weapon(&mut self) {
         let world = self.engine.world();
         let Some(state) = world
             .controlled_by(PLAYER)
@@ -176,7 +241,9 @@ impl Game {
         else {
             return;
         };
-        let current = self.switching.map_or(state.ready_weapon, |(weapon, _)| weapon);
+        let current = self
+            .switching
+            .map_or(state.ready_weapon, |(weapon, _)| weapon);
         let start = WEAPON_ORDER.iter().position(|&w| w == current).unwrap_or(0);
         let next = (1..WEAPON_ORDER.len())
             .map(|step| WEAPON_ORDER[(start + step) % WEAPON_ORDER.len()])
@@ -257,7 +324,10 @@ impl Game {
     fn carried_state(&self) -> Option<(neurodoom::PlayerState, i32)> {
         let world = self.engine.world();
         let player = world.controlled_by(PLAYER)?;
-        Some((world.player_state(player)?.clone(), world.get(player)?.health))
+        Some((
+            world.player_state(player)?.clone(),
+            world.get(player)?.health,
+        ))
     }
 
     /// Loads the current map, and gives the player the carried state, if any.

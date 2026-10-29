@@ -1,4 +1,7 @@
 //! Drawing on the RGB565 framebuffer: the scaled game view, shapes and text.
+//!
+//! Shapes over the game view are mixed into each row before the row goes to PSRAM,
+//! so the CPU never reads the framebuffer back for them.
 
 use embedded_graphics::{
     Pixel,
@@ -17,6 +20,64 @@ pub const VIEW_HEIGHT: usize = SCREENHEIGHT * SCALE;
 pub const VIEW_X: usize = (WIDTH - VIEW_WIDTH) / 2;
 pub const VIEW_Y: usize = (HEIGHT - VIEW_HEIGHT) / 2;
 
+/// How a shape mixes with what is under it.
+#[derive(Clone, Copy)]
+pub enum Paint {
+    Solid(u16),
+    /// Half of this color, half of the pixel under it.
+    Glass(u16),
+}
+
+impl Paint {
+    fn apply(self, pixels: &mut [u16]) {
+        match self {
+            Paint::Solid(color) => pixels.fill(color),
+            Paint::Glass(color) => {
+                for pixel in pixels {
+                    *pixel = half_mix(*pixel, color);
+                }
+            }
+        }
+    }
+}
+
+/// A filled circle, or a ring when `inner` is above zero.
+#[derive(Clone, Copy)]
+pub struct Shape {
+    pub x: i32,
+    pub y: i32,
+    pub outer: i32,
+    pub inner: i32,
+    pub paint: Paint,
+}
+
+impl Shape {
+    /// Calls `f` with the start and the exclusive end of each span on row `y`.
+    fn spans(&self, y: i32, mut f: impl FnMut(i32, i32)) {
+        let dy = y - self.y;
+        if dy.abs() > self.outer {
+            return;
+        }
+        let half = isqrt(self.outer * self.outer - dy * dy);
+        if dy.abs() < self.inner {
+            let hole = isqrt(self.inner * self.inner - dy * dy);
+            f(self.x - half, self.x - hole);
+            f(self.x + hole + 1, self.x + half + 1);
+        } else {
+            f(self.x - half, self.x + half + 1);
+        }
+    }
+
+    pub fn bounds(&self) -> Rect {
+        Rect {
+            x0: self.x - self.outer,
+            y0: self.y - self.outer,
+            x1: self.x + self.outer + 1,
+            y1: self.y + self.outer + 1,
+        }
+    }
+}
+
 /// A rectangle on the panel. `x1` and `y1` are exclusive.
 #[derive(Clone, Copy, Default)]
 pub struct Rect {
@@ -26,73 +87,78 @@ pub struct Rect {
     pub y1: i32,
 }
 
-impl Rect {
-    pub fn around(x: i32, y: i32, radius: i32) -> Self {
-        Self {
-            x0: x - radius,
-            y0: y - radius,
-            x1: x + radius + 1,
-            y1: y + radius + 1,
-        }
-    }
-}
-
-/// How a shape mixes with what is under it.
-#[derive(Clone, Copy)]
-pub enum Paint {
-    Solid(u16),
-    /// Half of this color, half of the pixel under it.
-    Glass(u16),
-}
-
 pub struct Canvas<'a> {
-    frame: &'a mut [u8],
+    /// The framebuffer's RGB565 pixels, row by row.
+    frame: &'a mut [u16],
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(frame: &'a mut [u8]) -> Self {
+        // SAFETY: any two bytes make a valid `u16`.
+        let (prefix, frame, _) = unsafe { frame.align_to_mut::<u16>() };
+        assert!(prefix.is_empty());
         Self { frame }
     }
 
-    /// Draws the game's 8-bit indexed picture, scaled up and centered.
-    pub fn draw_view(&mut self, screen: &[u8], palette: &[u16; 256]) {
-        let mut row = [0u8; VIEW_WIDTH * 2];
-        for (y, line) in screen.chunks_exact(SCREENWIDTH).enumerate() {
-            for (&index, out) in line.iter().zip(row.chunks_exact_mut(SCALE * 2)) {
-                let [lo, hi] = palette[usize::from(index)].to_le_bytes();
-                out.copy_from_slice(&[lo, hi, lo, hi]);
+    /// Draws the game's 8-bit indexed picture, scaled up and centered, with the
+    /// shapes on top.
+    pub fn draw_view(&mut self, screen: &[u8], palette: &[u16; 256], shapes: &[Shape]) {
+        let mut base = [0u16; VIEW_WIDTH];
+        let mut mixed = [0u16; VIEW_WIDTH];
+        for (y, line) in screen.as_chunks::<SCREENWIDTH>().0.iter().enumerate() {
+            for (&index, out) in line.iter().zip(base.as_chunks_mut::<SCALE>().0) {
+                out.fill(palette[usize::from(index)]);
             }
             for dy in 0..SCALE {
-                let start = ((VIEW_Y + y * SCALE + dy) * WIDTH + VIEW_X) * 2;
-                self.frame[start..start + row.len()].copy_from_slice(&row);
+                let panel_y = (VIEW_Y + y * SCALE + dy) as i32;
+                let mut is_mixed = false;
+                for shape in shapes {
+                    shape.spans(panel_y, |x0, x1| {
+                        let x0 = (x0 - VIEW_X as i32).clamp(0, VIEW_WIDTH as i32) as usize;
+                        let x1 = (x1 - VIEW_X as i32).clamp(0, VIEW_WIDTH as i32) as usize;
+                        if x0 < x1 {
+                            if !is_mixed {
+                                mixed = base;
+                                is_mixed = true;
+                            }
+                            shape.paint.apply(&mut mixed[x0..x1]);
+                        }
+                    });
+                }
+                let row = if is_mixed { &mixed } else { &base };
+                self.write_row(panel_y as usize, VIEW_X, row);
             }
         }
     }
 
-    pub fn fill_rect(&mut self, rect: Rect, color: u16) {
+    /// Draws the parts of the shapes that are outside the game view.
+    pub fn draw_around_view(&mut self, shapes: &[Shape]) {
+        for shape in shapes {
+            let bounds = shape.bounds();
+            for y in bounds.y0..bounds.y1 {
+                shape.spans(y, |x0, x1| self.span_around_view(y, x0, x1, shape.paint));
+            }
+        }
+    }
+
+    /// Fills the parts of the rectangle that are outside the game view.
+    pub fn clear_around_view(&mut self, rect: Rect) {
         for y in rect.y0..rect.y1 {
-            self.span(y, rect.x0, rect.x1, Paint::Solid(color));
+            self.span_around_view(y, rect.x0, rect.x1, Paint::Solid(0));
         }
     }
 
-    pub fn fill_circle(&mut self, cx: i32, cy: i32, radius: i32, paint: Paint) {
-        for dy in -radius..=radius {
-            let half = isqrt(radius * radius - dy * dy);
-            self.span(cy + dy, cx - half, cx + half + 1, paint);
-        }
+    pub fn clear(&mut self) {
+        self.frame.fill(0);
     }
 
-    /// A circle outline between the two radii.
-    pub fn ring(&mut self, cx: i32, cy: i32, outer: i32, inner: i32, paint: Paint) {
-        for dy in -outer..=outer {
-            let half = isqrt(outer * outer - dy * dy);
-            if dy.abs() < inner {
-                let hole = isqrt(inner * inner - dy * dy);
-                self.span(cy + dy, cx - half, cx - hole, paint);
-                self.span(cy + dy, cx + hole + 1, cx + half + 1, paint);
-            } else {
-                self.span(cy + dy, cx - half, cx + half + 1, paint);
-            }
+    fn span_around_view(&mut self, y: i32, x0: i32, x1: i32, paint: Paint) {
+        let view_rows = VIEW_Y as i32..(VIEW_Y + VIEW_HEIGHT) as i32;
+        if view_rows.contains(&y) {
+            self.span(y, x0, x1.min(VIEW_X as i32), paint);
+            self.span(y, x0.max((VIEW_X + VIEW_WIDTH) as i32), x1, paint);
+        } else {
+            self.span(y, x0, x1, paint);
         }
     }
 
@@ -106,22 +172,13 @@ impl<'a> Canvas<'a> {
         if x0 >= x1 {
             return;
         }
-        let row = y as usize * WIDTH * 2;
-        let pixels = &mut self.frame[row + x0 * 2..row + x1 * 2];
-        match paint {
-            Paint::Solid(color) => {
-                let bytes = color.to_le_bytes();
-                for pixel in pixels.chunks_exact_mut(2) {
-                    pixel.copy_from_slice(&bytes);
-                }
-            }
-            Paint::Glass(color) => {
-                for pixel in pixels.chunks_exact_mut(2) {
-                    let under = u16::from_le_bytes([pixel[0], pixel[1]]);
-                    pixel.copy_from_slice(&half_mix(under, color).to_le_bytes());
-                }
-            }
-        }
+        let start = y as usize * WIDTH;
+        paint.apply(&mut self.frame[start + x0..start + x1]);
+    }
+
+    fn write_row(&mut self, y: usize, x: usize, pixels: &[u16]) {
+        let start = y * WIDTH + x;
+        self.frame[start..start + pixels.len()].copy_from_slice(pixels);
     }
 }
 
@@ -135,9 +192,8 @@ impl DrawTarget for Canvas<'_> {
     {
         for Pixel(point, color) in pixels {
             if (0..WIDTH as i32).contains(&point.x) && (0..HEIGHT as i32).contains(&point.y) {
-                let index = (point.y as usize * WIDTH + point.x as usize) * 2;
-                let raw = RawU16::from(color).into_inner();
-                self.frame[index..index + 2].copy_from_slice(&raw.to_le_bytes());
+                self.frame[point.y as usize * WIDTH + point.x as usize] =
+                    RawU16::from(color).into_inner();
             }
         }
         Ok(())

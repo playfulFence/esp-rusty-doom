@@ -106,7 +106,11 @@ impl Touch {
             len,
             ..Default::default()
         };
-        for (point, raw) in touches.points.iter_mut().zip(raw.chunks_exact(POINT_BYTES)) {
+        for (point, raw) in touches
+            .points
+            .iter_mut()
+            .zip(raw.as_chunks::<POINT_BYTES>().0)
+        {
             let x = u16::from_le_bytes([raw[1], raw[2]]).min(WIDTH as u16 - 1);
             let y = u16::from_le_bytes([raw[3], raw[4]]).min(HEIGHT as u16 - 1);
             *point = TouchPoint {

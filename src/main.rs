@@ -10,7 +10,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, format, vec};
+use alloc::{boxed::Box, format, string::String, vec};
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
@@ -25,6 +25,7 @@ use esp_hal::{
     assign_resources,
     clock::{ClockConfig, CpuClock},
     ram,
+    system::Stack,
     timer::timg::TimerGroup,
 };
 use esp_println::println;
@@ -33,12 +34,15 @@ use miniz_oxide::inflate::{
     TINFLStatus,
     core::{DecompressorOxide, inflate_flags},
 };
+use static_cell::ConstStaticCell;
 
 use crate::{
-    canvas::{Canvas, Rect, VIEW_X, VIEW_Y, VIEW_WIDTH, VIEW_HEIGHT},
+    canvas::{Canvas, VIEW_HEIGHT, VIEW_WIDTH, VIEW_X, VIEW_Y},
     controls::Controls,
     display::{Display, HEIGHT, WIDTH},
-    game::{Game, Status, TICRATE},
+    game::{Game, Status},
+    mailbox::Picture,
+    pma::Pma,
     touch::Touch,
 };
 
@@ -46,6 +50,8 @@ mod canvas;
 mod controls;
 mod display;
 mod game;
+mod mailbox;
+mod pma;
 mod touch;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -53,10 +59,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// The WAD's size and its DEFLATE stream, made by `build.rs`.
 static COMPRESSED_WAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wad.deflate"));
 
-const TIC: Duration = Duration::from_micros(1_000_000 / TICRATE as u64);
-/// When rendering falls behind, the game runs at most this many tics per frame and
-/// then slows down.
-const MAX_TICS_PER_FRAME: u32 = 3;
+static GAME_STACK: ConstStaticCell<Stack<{ 64 * 1024 }>> = ConstStaticCell::new(Stack::new());
 
 // ESP32-S31-Korvo-1 with its LCD subboard.
 assign_resources! {
@@ -126,98 +129,94 @@ async fn main(_spawner: Spawner) -> ! {
         wad.len(),
         started.elapsed().as_millis()
     );
-    let started = Instant::now();
-    let mut game = Game::new(wad);
-    println!(
-        "Loaded {} in {} ms",
-        game.map_name(),
-        started.elapsed().as_millis()
-    );
-    println!("{}", esp_alloc::HEAP.stats());
+
+    // The game runs on the second core, and this core draws its pictures.
+    let pma = Pma::read();
+    let game_stack = GAME_STACK.take();
+    esp_rtos::start_second_core(peripherals.CPU_CTRL, game_stack, move || {
+        pma.apply();
+        let started = Instant::now();
+        let mut game = Game::new(wad);
+        // Internal RAM that the game's loading does not fill.
+        esp_alloc::heap_allocator!(size: 252 * 1024);
+        game.move_depth_buffer_to_internal_ram();
+        println!(
+            "Loaded {} in {} ms",
+            game.map_name(),
+            started.elapsed().as_millis()
+        );
+        println!("{}", esp_alloc::HEAP.stats());
+        game.run()
+    });
 
     let mut controls = Controls::new();
     let mut drawn = controls.bounds();
-    {
-        let mut canvas = Canvas::new(&mut display);
-        canvas.fill_rect(
-            Rect {
-                x0: 0,
-                y0: 0,
-                x1: WIDTH as i32,
-                y1: HEIGHT as i32,
-            },
-            0,
-        );
-    }
+    let mut hud = String::new();
+    let mut shown: Option<Picture> = None;
+    let mut loading = true;
 
-    let mut next_tic = Instant::now();
     let mut frames = 0u32;
-    let mut tics = 0u32;
     let mut fps = 0u32;
-    let mut busy = Duration::from_ticks(0);
+    let mut game_time = Duration::from_ticks(0);
+    let mut draw_time = Duration::from_ticks(0);
     let mut report = Instant::now();
 
     loop {
         if let Some(touches) = touch.read().await {
             controls.update(&touches);
         }
-        let input = controls.input();
-        if input.next_weapon {
-            game.next_weapon();
-        }
+        mailbox::post_input(controls.input());
 
-        let now = Instant::now();
-        if now < next_tic {
-            Timer::at(next_tic).await;
+        let Some(picture) = mailbox::take_picture(&mut shown) else {
+            Timer::after(Duration::from_millis(1)).await;
             continue;
+        };
+        if loading {
+            // The first picture replaces the loading message.
+            Canvas::new(&mut display).clear();
+            loading = false;
         }
-        let frame_start = now;
-        let mut ran = 0;
-        while next_tic <= now && ran < MAX_TICS_PER_FRAME {
-            game.tic(&input);
-            next_tic += TIC;
-            ran += 1;
-        }
-        if next_tic <= now {
-            next_tic = now + TIC;
-        }
-        tics += ran;
 
-        game.render();
+        let draw_start = Instant::now();
         {
             let mut canvas = Canvas::new(&mut display);
             for rect in drawn {
-                canvas.fill_rect(rect, 0);
+                canvas.clear_around_view(rect);
             }
-            canvas.draw_view(game.screen(), game.palette());
-            let status = game.status();
-            draw_hud(&mut canvas, game.map_name(), status, fps);
-            if status.is_none_or(|status| status.health <= 0) {
+            let shapes = controls.shapes();
+            canvas.draw_view(&picture.screen, &picture.palette, &shapes);
+            canvas.draw_around_view(&shapes);
+            controls.draw_labels(&mut canvas);
+            drawn = controls.bounds();
+
+            draw_hud(&mut canvas, &mut hud, &picture.map, picture.status, fps);
+            if picture.status.is_none_or(|status| status.health <= 0) {
                 draw_centered(
                     &mut canvas,
                     "You died. Press FIRE to restart.",
                     (VIEW_Y + VIEW_HEIGHT / 2) as i32,
                 );
             }
-            controls.draw(&mut canvas);
-            drawn = controls.bounds();
         }
         display.writeback(0..HEIGHT);
 
         frames += 1;
-        busy += frame_start.elapsed();
+        draw_time += draw_start.elapsed();
+        game_time += picture.game_time;
+        shown = Some(picture);
+
         let elapsed = report.elapsed();
         if elapsed >= Duration::from_secs(5) {
             fps = (frames as u64 * 1000 / elapsed.as_millis()) as u32;
             println!(
-                "{} fps, {} tics/s, {} ms per frame",
+                "{} fps, per frame: game {} ms, drawing {} ms",
                 fps,
-                tics as u64 * 1000 / elapsed.as_millis(),
-                busy.as_millis() / frames.max(1) as u64
+                game_time.as_millis() / frames as u64,
+                draw_time.as_millis() / frames as u64
             );
             frames = 0;
-            tics = 0;
-            busy = Duration::from_ticks(0);
+            game_time = Duration::from_ticks(0);
+            draw_time = Duration::from_ticks(0);
             report = Instant::now();
         }
     }
@@ -243,7 +242,36 @@ fn decompress_wad() -> &'static [u8] {
     wad.leak()
 }
 
-fn draw_hud(canvas: &mut Canvas<'_>, map: &str, status: Option<Status>, fps: u32) {
+/// Draws the line above the game view when its text changes.
+fn draw_hud(
+    canvas: &mut Canvas<'_>,
+    last: &mut String,
+    map: &str,
+    status: Option<Status>,
+    fps: u32,
+) {
+    let status = status.unwrap_or(Status {
+        health: 0,
+        armor: 0,
+        ammo: None,
+    });
+    let ammo = match status.ammo {
+        Some(ammo) => format!("{ammo:3}"),
+        None => String::from("  -"),
+    };
+    let line = format!(
+        "HEALTH {:3}%   ARMOR {:3}%   AMMO {}",
+        status.health.max(0),
+        status.armor,
+        ammo
+    );
+    let fps = format!("{fps:2} FPS");
+    let text = format!("{map}{line}{fps}");
+    if *last == text {
+        return;
+    }
+    *last = text;
+
     let style = MonoTextStyleBuilder::new()
         .font(&FONT_10X20)
         .text_color(Rgb565::new(31, 50, 0))
@@ -261,28 +289,15 @@ fn draw_hud(canvas: &mut Canvas<'_>, map: &str, status: Option<Status>, fps: u32
         .build();
 
     let _ = Text::with_text_style(map, Point::new(VIEW_X as i32, y), style, left).draw(canvas);
-
-    let status = status.unwrap_or(Status {
-        health: 0,
-        armor: 0,
-        ammo: None,
-    });
-    let ammo = match status.ammo {
-        Some(ammo) => format!("{ammo:3}"),
-        None => format!("  -"),
-    };
-    let line = format!(
-        "HEALTH {:3}%   ARMOR {:3}%   AMMO {}",
-        status.health.max(0),
-        status.armor,
-        ammo
-    );
-    let _ = Text::with_text_style(&line, Point::new(WIDTH as i32 / 2, y), style, center)
-        .draw(canvas);
-
-    let fps = format!("{fps:2} FPS");
-    let _ = Text::with_text_style(&fps, Point::new((VIEW_X + VIEW_WIDTH) as i32, y), style, right)
-        .draw(canvas);
+    let _ =
+        Text::with_text_style(&line, Point::new(WIDTH as i32 / 2, y), style, center).draw(canvas);
+    let _ = Text::with_text_style(
+        &fps,
+        Point::new((VIEW_X + VIEW_WIDTH) as i32, y),
+        style,
+        right,
+    )
+    .draw(canvas);
 }
 
 fn draw_centered(canvas: &mut Canvas<'_>, text: &str, y: i32) {

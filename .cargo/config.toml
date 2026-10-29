@@ -2,7 +2,7 @@
 target = "riscv32imafc-unknown-none-elf"
 
 [target.riscv32imafc-unknown-none-elf]
-runner = "espflash flash --monitor"
+runner = "espflash flash --baud 921600 --monitor"
 rustflags = [
   "-C", "link-arg=-Tlinkall.x",
   "-C", "force-frame-pointers",
@@ -10,6 +10,8 @@ rustflags = [
 
 [env]
 ESP_LOG = "info"
+# Room for the internal RAM that the game gets after loading.
+ESP_ALLOC_CONFIG_MAX_REGIONS = "4"
 # The game data. Point this to another IWAD to play it instead, for example with
 # `DOOM_WAD=/path/to/doom1.wad cargo run --release`.
 DOOM_WAD = { value = "../wads/doom1.wad", relative = true, force = false }

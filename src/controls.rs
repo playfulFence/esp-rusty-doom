@@ -10,7 +10,7 @@ use embedded_graphics::{
 };
 
 use crate::{
-    canvas::{Canvas, Paint, Rect, isqrt, rgb565},
+    canvas::{Canvas, Paint, Rect, Shape, VIEW_Y, isqrt, rgb565},
     display::{HEIGHT, WIDTH},
     touch::Touches,
 };
@@ -62,12 +62,12 @@ impl Stick {
         }
     }
 
-    /// Puts the stick under the finger, fully on the screen.
+    /// Puts the stick under the finger, fully on the screen and below the HUD.
     fn grab(&mut self, finger: u8, x: i32, y: i32) {
         let margin = STICK_RADIUS + KNOB_RADIUS;
         self.center = (
             x.clamp(margin, WIDTH as i32 - margin),
-            y.clamp(margin, HEIGHT as i32 - margin),
+            y.clamp(VIEW_Y as i32 + margin, HEIGHT as i32 - margin),
         );
         self.finger = Some(finger);
         self.drag(x, y);
@@ -105,16 +105,34 @@ impl Stick {
         )
     }
 
-    fn draw(&self, canvas: &mut Canvas<'_>) {
-        let (cx, cy) = self.center;
-        let active = self.finger.is_some();
-        canvas.ring(cx, cy, STICK_RADIUS, STICK_RADIUS - 4, Paint::Glass(GREY));
-        let knob = if active { WHITE } else { GREY };
-        canvas.fill_circle(self.knob.0, self.knob.1, KNOB_RADIUS, Paint::Glass(knob));
+    fn shapes(&self) -> [Shape; 2] {
+        let knob = if self.finger.is_some() { WHITE } else { GREY };
+        [
+            Shape {
+                x: self.center.0,
+                y: self.center.1,
+                outer: STICK_RADIUS,
+                inner: STICK_RADIUS - 4,
+                paint: Paint::Glass(GREY),
+            },
+            Shape {
+                x: self.knob.0,
+                y: self.knob.1,
+                outer: KNOB_RADIUS,
+                inner: 0,
+                paint: Paint::Glass(knob),
+            },
+        ]
     }
 
     fn bounds(&self) -> Rect {
-        Rect::around(self.center.0, self.center.1, STICK_RADIUS + KNOB_RADIUS)
+        let reach = STICK_RADIUS + KNOB_RADIUS;
+        Rect {
+            x0: self.center.0 - reach,
+            y0: self.center.1 - reach,
+            x1: self.center.0 + reach + 1,
+            y1: self.center.1 + reach + 1,
+        }
     }
 }
 
@@ -143,26 +161,40 @@ impl Button {
         dx * dx + dy * dy <= reach * reach
     }
 
-    fn draw(&self, canvas: &mut Canvas<'_>) {
-        let (cx, cy) = self.center;
-        let paint = if self.finger.is_some() {
+    fn shapes(&self) -> [Shape; 2] {
+        let (x, y) = self.center;
+        let fill = if self.finger.is_some() {
             Paint::Solid(self.color)
         } else {
             Paint::Glass(self.color)
         };
-        canvas.fill_circle(cx, cy, self.radius, paint);
-        canvas.ring(cx, cy, self.radius, self.radius - 3, Paint::Glass(WHITE));
+        [
+            Shape {
+                x,
+                y,
+                outer: self.radius,
+                inner: 0,
+                paint: fill,
+            },
+            Shape {
+                x,
+                y,
+                outer: self.radius,
+                inner: self.radius - 3,
+                paint: Paint::Glass(WHITE),
+            },
+        ]
+    }
+
+    fn draw_label(&self, canvas: &mut Canvas<'_>) {
+        let (cx, cy) = self.center;
         let style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
         let text_style = TextStyleBuilder::new()
             .alignment(Alignment::Center)
             .baseline(Baseline::Middle)
             .build();
-        let _ = Text::with_text_style(self.label, Point::new(cx, cy), style, text_style)
-            .draw(canvas);
-    }
-
-    fn bounds(&self) -> Rect {
-        Rect::around(self.center.0, self.center.1, self.radius)
+        let _ =
+            Text::with_text_style(self.label, Point::new(cx, cy), style, text_style).draw(canvas);
     }
 }
 
@@ -248,22 +280,30 @@ impl Controls {
         }
     }
 
-    pub fn draw(&self, canvas: &mut Canvas<'_>) {
-        self.walk.draw(canvas);
-        self.look.draw(canvas);
-        self.fire.draw(canvas);
-        self.use_.draw(canvas);
-        self.weapon.draw(canvas);
+    /// The sticks and the buttons, without their labels.
+    pub fn shapes(&self) -> [Shape; 10] {
+        let [a, b] = self.walk.shapes();
+        let [c, d] = self.look.shapes();
+        let [e, f] = self.fire.shapes();
+        let [g, h] = self.use_.shapes();
+        let [i, j] = self.weapon.shapes();
+        [a, b, c, d, e, f, g, h, i, j]
     }
 
-    /// The areas that [`Controls::draw`] paints.
+    pub fn draw_labels(&self, canvas: &mut Canvas<'_>) {
+        self.fire.draw_label(canvas);
+        self.use_.draw_label(canvas);
+        self.weapon.draw_label(canvas);
+    }
+
+    /// The areas that the controls cover.
     pub fn bounds(&self) -> [Rect; 5] {
         [
             self.walk.bounds(),
             self.look.bounds(),
-            self.fire.bounds(),
-            self.use_.bounds(),
-            self.weapon.bounds(),
+            self.fire.shapes()[0].bounds(),
+            self.use_.shapes()[0].bounds(),
+            self.weapon.shapes()[0].bounds(),
         ]
     }
 }
