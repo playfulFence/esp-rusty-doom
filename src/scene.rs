@@ -114,9 +114,9 @@ pub fn draw_rows(first_row: usize, rows: &mut [u16]) {
     };
 
     let view_rows = VIEW_Y..VIEW_Y + VIEW_HEIGHT;
-    let mut pairs = rows.as_chunks_mut::<{ WIDTH * 2 }>().0.iter_mut();
-    let mut y = first_row;
-    for pair in &mut pairs {
+    let pairs = rows.as_chunks_mut::<{ WIDTH * 2 }>().0;
+    for (i, pair) in pairs.iter_mut().enumerate() {
+        let y = first_row + 2 * i;
         let (upper, lower) = pair.split_at_mut(WIDTH);
         // Both rows of a pair show the same game row, so the second one is a copy.
         match &scene.picture {
@@ -130,6 +130,5 @@ pub fn draw_rows(first_row: usize, rows: &mut [u16]) {
         lower.copy_from_slice(upper);
         scene.draw_overlays(y as i32, upper);
         scene.draw_overlays(y as i32 + 1, lower);
-        y += 2;
     }
 }

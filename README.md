@@ -3,11 +3,11 @@
 Doom in pure Rust on the [ESP32-S31-Korvo-1](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-korvo-1/index.html),
 with touch controls on the screen like in mobile shooters.
 
-- The [`neurodoom`](https://crates.io/crates/neurodoom) crate runs the game: a `no_std` Rust port
-  of the Doom engine.
-- The game runs on the second core. The first core reads the touch panel and draws the picture,
-  scaled up 2x, on the 800x480 LCD.
-- Speed: about 28 frames per second, close to the panel's 30 Hz refresh.
+![Doom on the ESP32-S31-Korvo-1](media/doom.gif)
+
+The [`neurodoom`](https://crates.io/crates/neurodoom) crate runs the game: a `no_std` Rust port of
+the Doom engine. The game makes about 32 pictures per second, and the 800x480 panel refreshes at
+30 Hz.
 
 ## Controls
 
@@ -21,10 +21,47 @@ with touch controls on the screen like in mobile shooters.
 
 After you die, press FIRE to restart the level.
 
+## How it works
+
+**Game data.** The firmware contains the WAD file. The flash region for code and constants holds
+only 4 MB, so `build.rs` compresses the 4.2 MB shareware WAD to 1.77 MB. At boot, the firmware
+unpacks it into PSRAM in about 0.7 s.
+
+**Engine.** The game runs on the second core: 35 game tics per second, then one 320x200 picture in
+which each pixel is a palette index. The second core needs two changes for this:
+
+- It copies the Physical Memory Attributes (PMA) from the first core, see `src/pma.rs`. The
+  bootloader sets them up only on the first core, and without them PSRAM access faults.
+- The renderer's depth buffer moves to internal RAM after loading. PSRAM is too slow for it.
+
+**Mailbox.** The first core posts the touch input, and the second core posts the newest picture
+with its palette and the player's health, armor and ammo. Each side takes only the newest item, so
+neither core waits for the other. See `src/mailbox.rs`.
+
+**Touch controls.** The Goodix touch controller reports up to 5 fingers over I2C. A finger on the
+left half becomes a floating walk stick, and a finger on the right half becomes a turn stick. Round
+buttons fire, use and switch weapons. The stick offsets become Doom's forward, strafe and turn
+values. See `src/controls.rs`.
+
+**Display without a framebuffer.** The LCD's DMA reads two small buffers in internal RAM in a loop,
+4 panel rows each. When it finishes one, an interrupt on the first core draws the next 4 rows into
+it: each game pixel as 2x2 panel pixels, then the controls and the text on top. See
+`src/display.rs` and `src/scene.rs`.
+
+**Why no framebuffer.** At first, the LCD read a 768 KB framebuffer in PSRAM. While both cores used
+PSRAM, the DMA fell behind, and each delay shifted the picture to the right. Internal RAM does not
+have this traffic, so the LCD always gets its data in time.
+
+**Two hardware details.**
+
+- With its reset settings, the DMA channel signals the end of a buffer (EOF) for only every third
+  buffer. The firmware selects the EOF mode that ESP-IDF's RGB LCD driver uses.
+- At each VSYNC (the start of a frame), the interrupt puts its row counter back in step with the
+  panel. A delayed interrupt can spoil at most one frame.
+
 ## Game data
 
-The firmware needs a Doom IWAD. The build compresses it and puts it into the firmware. The
-shareware `doom1.wad` (episode 1, freely distributable) fits.
+The firmware needs a Doom IWAD. The shareware `doom1.wad` (episode 1, freely distributable) fits.
 
 Get it from the shareware v1.9 package:
 
@@ -48,15 +85,10 @@ DOOM_WAD=/path/to/doom1.wad cargo run --release
 cargo run --release
 ```
 
-The image is about 2 MB, so `cargo run` flashes at 921600 baud.
+The image is about 2 MB, so `cargo run` flashes at 921600 baud. Every 5 seconds, the firmware
+prints the frame rate and how busy the display interrupt is.
 
-## Notes
+## Limits
 
 - The engine has no sound and no menus.
-- The bootloader sets up the Physical Memory Attributes (PMA) only on the first core. The second
-  core copies them before it touches PSRAM, see `src/pma.rs`.
-- The renderer's depth buffer moves to internal RAM after loading. PSRAM is too slow for it.
-- There is no framebuffer. The LCD reads two 4-row bounce buffers in internal RAM, and an interrupt
-  on the first core draws the next rows into each one when the LCD finishes it: the game picture,
-  scaled 2x, with the controls and the text on top. When the LCD read a framebuffer in PSRAM, it
-  fell behind while both cores used PSRAM, and the picture shifted.
+- Only the ESP32-S31-Korvo-1 with its LCD subboard is supported.
