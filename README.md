@@ -1,4 +1,4 @@
-# esp-doom
+# esp-rusty-doom
 
 Doom in pure Rust on the [ESP32-S31-Korvo-1](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-korvo-1/index.html),
 with touch controls on the screen like in mobile shooters.
