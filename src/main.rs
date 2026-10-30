@@ -14,12 +14,7 @@ use alloc::{boxed::Box, format, string::String, vec};
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
-use embedded_graphics::{
-    mono_font::{MonoTextStyle, MonoTextStyleBuilder, ascii::FONT_10X20},
-    pixelcolor::Rgb565,
-    prelude::*,
-    text::{Alignment, Baseline, Text, TextStyleBuilder},
-};
+use embedded_graphics::text::Alignment;
 use esp_backtrace as _;
 use esp_hal::{
     assign_resources,
@@ -34,15 +29,15 @@ use miniz_oxide::inflate::{
     TINFLStatus,
     core::{DecompressorOxide, inflate_flags},
 };
-use static_cell::ConstStaticCell;
+use static_cell::{ConstStaticCell, StaticCell};
 
 use crate::{
-    canvas::{Canvas, VIEW_HEIGHT, VIEW_WIDTH, VIEW_X, VIEW_Y},
+    canvas::{Mask, VIEW_HEIGHT, VIEW_WIDTH, VIEW_X, VIEW_Y, rgb565},
     controls::Controls,
     display::{Display, HEIGHT, WIDTH},
     game::{Game, Status},
-    mailbox::Picture,
     pma::Pma,
+    scene::{Overlays, Scene},
     touch::Touch,
 };
 
@@ -52,7 +47,10 @@ mod display;
 mod game;
 mod mailbox;
 mod pma;
+mod scene;
 mod touch;
+
+const WHITE: u16 = rgb565(255, 255, 255);
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -60,6 +58,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 static COMPRESSED_WAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wad.deflate"));
 
 static GAME_STACK: ConstStaticCell<Stack<{ 64 * 1024 }>> = ConstStaticCell::new(Stack::new());
+static OVERLAYS: StaticCell<Overlays> = StaticCell::new();
 
 // ESP32-S31-Korvo-1 with its LCD subboard.
 assign_resources! {
@@ -112,12 +111,26 @@ async fn main(_spawner: Spawner) -> ! {
 
     let resources = split_resources!(peripherals);
 
-    let mut display = Display::new(resources.lcd);
-    {
-        let mut canvas = Canvas::new(&mut display);
-        draw_centered(&mut canvas, "Loading DOOM...", HEIGHT as i32 / 2);
-    }
-    display.writeback(0..HEIGHT);
+    let mut controls = Controls::new();
+    let overlays = OVERLAYS.init(Overlays {
+        labels: controls.labels(),
+        loading: Mask::text(
+            "Loading DOOM...",
+            WIDTH as i32 / 2,
+            HEIGHT as i32 / 2,
+            WHITE,
+        ),
+        died: Mask::text(
+            "You died. Press FIRE to restart.",
+            WIDTH as i32 / 2,
+            (VIEW_Y + VIEW_HEIGHT / 2) as i32,
+            WHITE,
+        ),
+    });
+    let mut loading = Box::new(Scene::new(overlays));
+    loading.message = Some(&overlays.loading);
+    scene::post(loading);
+    let display = Display::new(resources.lcd);
 
     let mut touch = Touch::new(resources.touch).await;
     println!("Goodix touch controller at 0x{:02x}", touch.address());
@@ -149,16 +162,12 @@ async fn main(_spawner: Spawner) -> ! {
         game.run()
     });
 
-    let mut controls = Controls::new();
-    let mut drawn = controls.bounds();
-    let mut hud = String::new();
-    let mut shown: Option<Picture> = None;
-    let mut loading = true;
+    // A scene that was posted but never shown.
+    let mut spare: Option<Box<Scene>> = None;
 
     let mut frames = 0u32;
     let mut fps = 0u32;
     let mut game_time = Duration::from_ticks(0);
-    let mut draw_time = Duration::from_ticks(0);
     let mut report = Instant::now();
 
     loop {
@@ -167,56 +176,41 @@ async fn main(_spawner: Spawner) -> ! {
         }
         mailbox::post_input(controls.input());
 
-        let Some(picture) = mailbox::take_picture(&mut shown) else {
+        let Some(picture) = mailbox::take_picture() else {
             Timer::after(Duration::from_millis(1)).await;
             continue;
         };
-        if loading {
-            // The first picture replaces the loading message.
-            Canvas::new(&mut display).clear();
-            loading = false;
-        }
-
-        let draw_start = Instant::now();
-        {
-            let mut canvas = Canvas::new(&mut display);
-            for rect in drawn {
-                canvas.clear_around_view(rect);
-            }
-            let shapes = controls.shapes();
-            canvas.draw_view(&picture.screen, &picture.palette, &shapes);
-            canvas.draw_around_view(&shapes);
-            controls.draw_labels(&mut canvas);
-            drawn = controls.bounds();
-
-            draw_hud(&mut canvas, &mut hud, &picture.map, picture.status, fps);
-            if picture.status.is_none_or(|status| status.health <= 0) {
-                draw_centered(
-                    &mut canvas,
-                    "You died. Press FIRE to restart.",
-                    (VIEW_Y + VIEW_HEIGHT / 2) as i32,
-                );
-            }
-        }
-        display.writeback(0..HEIGHT);
-
+        let mut next = scene::take_done()
+            .or_else(|| spare.take())
+            .unwrap_or_else(|| Box::new(Scene::new(overlays)));
         frames += 1;
-        draw_time += draw_start.elapsed();
         game_time += picture.game_time;
-        shown = Some(picture);
+        update_hud(&mut next, &picture.map, picture.status, fps);
+        next.message = picture
+            .status
+            .is_none_or(|status| status.health <= 0)
+            .then_some(&overlays.died);
+        next.shapes = Some(controls.shapes());
+        if let Some(old) = next.picture.replace(picture) {
+            mailbox::give_back(old);
+        }
+        if let Some(unshown) = scene::post(next) {
+            spare = Some(unshown);
+        }
 
         let elapsed = report.elapsed();
         if elapsed >= Duration::from_secs(5) {
             fps = (frames as u64 * 1000 / elapsed.as_millis()) as u32;
             println!(
-                "{} fps, per frame: game {} ms, drawing {} ms",
+                "{} fps, game {} ms per frame; drawing the panel takes {}% of this core; {} late refills, {} frames with LCD underruns",
                 fps,
                 game_time.as_millis() / frames as u64,
-                draw_time.as_millis() / frames as u64
+                display.take_draw_micros() as u64 * 100 / elapsed.as_micros(),
+                display.take_late_refills(),
+                display.take_underruns()
             );
             frames = 0;
             game_time = Duration::from_ticks(0);
-            draw_time = Duration::from_ticks(0);
             report = Instant::now();
         }
     }
@@ -242,14 +236,8 @@ fn decompress_wad() -> &'static [u8] {
     wad.leak()
 }
 
-/// Draws the line above the game view when its text changes.
-fn draw_hud(
-    canvas: &mut Canvas<'_>,
-    last: &mut String,
-    map: &str,
-    status: Option<Status>,
-    fps: u32,
-) {
+/// Writes the line above the game view, when its text changes.
+fn update_hud(scene: &mut Scene, map: &str, status: Option<Status>, fps: u32) {
     let status = status.unwrap_or(Status {
         health: 0,
         armor: 0,
@@ -267,45 +255,15 @@ fn draw_hud(
     );
     let fps = format!("{fps:2} FPS");
     let text = format!("{map}{line}{fps}");
-    if *last == text {
+    if scene.hud_text == text {
         return;
     }
-    *last = text;
 
-    let style = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
-        .text_color(Rgb565::new(31, 50, 0))
-        .background_color(Rgb565::BLACK)
-        .build();
+    let hud = &mut scene.hud;
     let y = VIEW_Y as i32 / 2;
-    let left = TextStyleBuilder::new().baseline(Baseline::Middle).build();
-    let center = TextStyleBuilder::new()
-        .alignment(Alignment::Center)
-        .baseline(Baseline::Middle)
-        .build();
-    let right = TextStyleBuilder::new()
-        .alignment(Alignment::Right)
-        .baseline(Baseline::Middle)
-        .build();
-
-    let _ = Text::with_text_style(map, Point::new(VIEW_X as i32, y), style, left).draw(canvas);
-    let _ =
-        Text::with_text_style(&line, Point::new(WIDTH as i32 / 2, y), style, center).draw(canvas);
-    let _ = Text::with_text_style(
-        &fps,
-        Point::new((VIEW_X + VIEW_WIDTH) as i32, y),
-        style,
-        right,
-    )
-    .draw(canvas);
-}
-
-fn draw_centered(canvas: &mut Canvas<'_>, text: &str, y: i32) {
-    let style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    let text_style = TextStyleBuilder::new()
-        .alignment(Alignment::Center)
-        .baseline(Baseline::Middle)
-        .build();
-    let _ = Text::with_text_style(text, Point::new(WIDTH as i32 / 2, y), style, text_style)
-        .draw(canvas);
+    hud.clear();
+    hud.write(map, VIEW_X as i32, y, Alignment::Left);
+    hud.write(&line, WIDTH as i32 / 2, y, Alignment::Center);
+    hud.write(&fps, (VIEW_X + VIEW_WIDTH) as i32, y, Alignment::Right);
+    scene.hud_text = text;
 }

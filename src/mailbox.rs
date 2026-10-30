@@ -1,5 +1,5 @@
 //! Passes the touch input to the game on the second core, and the game's pictures
-//! back to the first core, which draws them.
+//! back to the first core, which shows them.
 
 use alloc::{string::String, vec, vec::Vec};
 use core::cell::RefCell;
@@ -88,14 +88,13 @@ pub fn post_picture(fill: impl FnOnce(&mut Picture)) {
     });
 }
 
-/// Takes the newest picture, if there is one, and gives back the one that is done.
-pub fn take_picture(done: &mut Option<Picture>) -> Option<Picture> {
-    critical_section::with(|cs| {
-        let mut mailbox = MAILBOX.borrow_ref_mut(cs);
-        let picture = mailbox.picture.take()?;
-        if let Some(done) = done.take() {
-            mailbox.spare = Some(done);
-        }
-        Some(picture)
-    })
+/// Takes the newest picture, if there is one.
+pub fn take_picture() -> Option<Picture> {
+    critical_section::with(|cs| MAILBOX.borrow_ref_mut(cs).picture.take())
+}
+
+/// Gives back a picture that the panel no longer shows, for reuse.
+pub fn give_back(picture: Picture) {
+    let unused = critical_section::with(|cs| MAILBOX.borrow_ref_mut(cs).spare.replace(picture));
+    drop(unused);
 }

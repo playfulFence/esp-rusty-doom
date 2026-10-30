@@ -1,12 +1,14 @@
-//! Drawing on the RGB565 framebuffer: the scaled game view, shapes and text.
-//!
-//! Shapes over the game view are mixed into each row before the row goes to PSRAM,
-//! so the CPU never reads the framebuffer back for them.
+//! Drawing primitives for panel rows: the scaled game view, round shapes and text
+//! masks. All of them work on one RGB565 row at a time.
+
+use alloc::{vec, vec::Vec};
 
 use embedded_graphics::{
     Pixel,
-    pixelcolor::{Rgb565, raw::RawU16},
+    mono_font::{MonoTextStyle, ascii::FONT_10X20},
+    pixelcolor::BinaryColor,
     prelude::*,
+    text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use neurodoom::{SCREENHEIGHT, SCREENWIDTH};
 
@@ -19,6 +21,16 @@ pub const VIEW_HEIGHT: usize = SCREENHEIGHT * SCALE;
 /// The top left corner of the centered game view.
 pub const VIEW_X: usize = (WIDTH - VIEW_WIDTH) / 2;
 pub const VIEW_Y: usize = (HEIGHT - VIEW_HEIGHT) / 2;
+
+/// Draws one row of the game view, scaled up, with black on both sides.
+pub fn draw_view_row(screen_row: &[u8], palette: &[u16; 256], row: &mut [u16]) {
+    row[..VIEW_X].fill(0);
+    row[VIEW_X + VIEW_WIDTH..].fill(0);
+    let view = &mut row[VIEW_X..VIEW_X + VIEW_WIDTH];
+    for (&index, out) in screen_row.iter().zip(view.as_chunks_mut::<SCALE>().0) {
+        out.fill(palette[usize::from(index)]);
+    }
+}
 
 /// How a shape mixes with what is under it.
 #[derive(Clone, Copy)]
@@ -52,8 +64,8 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// Calls `f` with the start and the exclusive end of each span on row `y`.
-    fn spans(&self, y: i32, mut f: impl FnMut(i32, i32)) {
+    /// Paints the shape's part of panel row `y`.
+    pub fn draw_row(&self, y: i32, row: &mut [u16]) {
         let dy = y - self.y;
         if dy.abs() > self.outer {
             return;
@@ -61,129 +73,100 @@ impl Shape {
         let half = isqrt(self.outer * self.outer - dy * dy);
         if dy.abs() < self.inner {
             let hole = isqrt(self.inner * self.inner - dy * dy);
-            f(self.x - half, self.x - hole);
-            f(self.x + hole + 1, self.x + half + 1);
+            self.span(row, self.x - half, self.x - hole);
+            self.span(row, self.x + hole + 1, self.x + half + 1);
         } else {
-            f(self.x - half, self.x + half + 1);
+            self.span(row, self.x - half, self.x + half + 1);
         }
     }
 
-    pub fn bounds(&self) -> Rect {
-        Rect {
-            x0: self.x - self.outer,
-            y0: self.y - self.outer,
-            x1: self.x + self.outer + 1,
-            y1: self.y + self.outer + 1,
+    fn span(&self, row: &mut [u16], x0: i32, x1: i32) {
+        let x0 = x0.clamp(0, WIDTH as i32) as usize;
+        let x1 = x1.clamp(0, WIDTH as i32) as usize;
+        if x0 < x1 {
+            self.paint.apply(&mut row[x0..x1]);
         }
     }
 }
 
-/// A rectangle on the panel. `x1` and `y1` are exclusive.
-#[derive(Clone, Copy, Default)]
-pub struct Rect {
-    pub x0: i32,
-    pub y0: i32,
-    pub x1: i32,
-    pub y1: i32,
+/// A one-color picture with one bit per pixel, for text.
+pub struct Mask {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    words_per_row: usize,
+    bits: Vec<u32>,
+    color: u16,
 }
 
-pub struct Canvas<'a> {
-    /// The framebuffer's RGB565 pixels, row by row.
-    frame: &'a mut [u16],
-}
-
-impl<'a> Canvas<'a> {
-    pub fn new(frame: &'a mut [u8]) -> Self {
-        // SAFETY: any two bytes make a valid `u16`.
-        let (prefix, frame, _) = unsafe { frame.align_to_mut::<u16>() };
-        assert!(prefix.is_empty());
-        Self { frame }
-    }
-
-    /// Draws the game's 8-bit indexed picture, scaled up and centered, with the
-    /// shapes on top.
-    pub fn draw_view(&mut self, screen: &[u8], palette: &[u16; 256], shapes: &[Shape]) {
-        let mut base = [0u16; VIEW_WIDTH];
-        let mut mixed = [0u16; VIEW_WIDTH];
-        for (y, line) in screen.as_chunks::<SCREENWIDTH>().0.iter().enumerate() {
-            for (&index, out) in line.iter().zip(base.as_chunks_mut::<SCALE>().0) {
-                out.fill(palette[usize::from(index)]);
-            }
-            for dy in 0..SCALE {
-                let panel_y = (VIEW_Y + y * SCALE + dy) as i32;
-                let mut is_mixed = false;
-                for shape in shapes {
-                    shape.spans(panel_y, |x0, x1| {
-                        let x0 = (x0 - VIEW_X as i32).clamp(0, VIEW_WIDTH as i32) as usize;
-                        let x1 = (x1 - VIEW_X as i32).clamp(0, VIEW_WIDTH as i32) as usize;
-                        if x0 < x1 {
-                            if !is_mixed {
-                                mixed = base;
-                                is_mixed = true;
-                            }
-                            shape.paint.apply(&mut mixed[x0..x1]);
-                        }
-                    });
-                }
-                let row = if is_mixed { &mixed } else { &base };
-                self.write_row(panel_y as usize, VIEW_X, row);
-            }
+impl Mask {
+    /// An empty mask that covers the given panel area.
+    pub fn new(x: i32, y: i32, width: i32, height: i32, color: u16) -> Self {
+        let words_per_row = (width as usize).div_ceil(32);
+        Self {
+            x,
+            y,
+            width,
+            height,
+            words_per_row,
+            bits: vec![0; words_per_row * height as usize],
+            color,
         }
     }
 
-    /// Draws the parts of the shapes that are outside the game view.
-    pub fn draw_around_view(&mut self, shapes: &[Shape]) {
-        for shape in shapes {
-            let bounds = shape.bounds();
-            for y in bounds.y0..bounds.y1 {
-                shape.spans(y, |x0, x1| self.span_around_view(y, x0, x1, shape.paint));
-            }
-        }
+    /// A mask with one line of text, centered on the point.
+    pub fn text(text: &str, x: i32, y: i32, color: u16) -> Self {
+        let size = FONT_10X20.character_size;
+        let (width, height) = (text.len() as i32 * size.width as i32, size.height as i32);
+        let mut mask = Self::new(
+            x - width / 2 - 1,
+            y - height / 2 - 1,
+            width + 2,
+            height + 2,
+            color,
+        );
+        mask.write(text, x, y, Alignment::Center);
+        mask
     }
 
-    /// Fills the parts of the rectangle that are outside the game view.
-    pub fn clear_around_view(&mut self, rect: Rect) {
-        for y in rect.y0..rect.y1 {
-            self.span_around_view(y, rect.x0, rect.x1, Paint::Solid(0));
-        }
+    /// Writes one line of text, aligned on `x` and centered on `y`.
+    pub fn write(&mut self, text: &str, x: i32, y: i32, alignment: Alignment) {
+        let style = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
+        let text_style = TextStyleBuilder::new()
+            .alignment(alignment)
+            .baseline(Baseline::Middle)
+            .build();
+        let _ = Text::with_text_style(text, Point::new(x, y), style, text_style).draw(self);
     }
 
     pub fn clear(&mut self) {
-        self.frame.fill(0);
+        self.bits.fill(0);
     }
 
-    fn span_around_view(&mut self, y: i32, x0: i32, x1: i32, paint: Paint) {
-        let view_rows = VIEW_Y as i32..(VIEW_Y + VIEW_HEIGHT) as i32;
-        if view_rows.contains(&y) {
-            self.span(y, x0, x1.min(VIEW_X as i32), paint);
-            self.span(y, x0.max((VIEW_X + VIEW_WIDTH) as i32), x1, paint);
-        } else {
-            self.span(y, x0, x1, paint);
-        }
-    }
-
-    /// Paints row `y` from `x0` up to `x1`, clipped to the panel.
-    fn span(&mut self, y: i32, x0: i32, x1: i32, paint: Paint) {
-        if !(0..HEIGHT as i32).contains(&y) {
+    /// Paints the mask's part of panel row `y`.
+    pub fn draw_row(&self, y: i32, row: &mut [u16]) {
+        let line = y - self.y;
+        if !(0..self.height).contains(&line) {
             return;
         }
-        let x0 = x0.clamp(0, WIDTH as i32) as usize;
-        let x1 = x1.clamp(0, WIDTH as i32) as usize;
-        if x0 >= x1 {
-            return;
+        let words = &self.bits[line as usize * self.words_per_row..][..self.words_per_row];
+        for (index, &word) in words.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                let x = self.x + (index * 32) as i32 + word.trailing_zeros() as i32;
+                if (0..WIDTH as i32).contains(&x) {
+                    row[x as usize] = self.color;
+                }
+                word &= word - 1;
+            }
         }
-        let start = y as usize * WIDTH;
-        paint.apply(&mut self.frame[start + x0..start + x1]);
-    }
-
-    fn write_row(&mut self, y: usize, x: usize, pixels: &[u16]) {
-        let start = y * WIDTH + x;
-        self.frame[start..start + pixels.len()].copy_from_slice(pixels);
     }
 }
 
-impl DrawTarget for Canvas<'_> {
-    type Color = Rgb565;
+/// Draws in panel coordinates. Pixels outside the mask are dropped.
+impl DrawTarget for Mask {
+    type Color = BinaryColor;
     type Error = core::convert::Infallible;
 
     fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
@@ -191,16 +174,17 @@ impl DrawTarget for Canvas<'_> {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(point, color) in pixels {
-            if (0..WIDTH as i32).contains(&point.x) && (0..HEIGHT as i32).contains(&point.y) {
-                self.frame[point.y as usize * WIDTH + point.x as usize] =
-                    RawU16::from(color).into_inner();
+            let (x, y) = (point.x - self.x, point.y - self.y);
+            if color.is_on() && (0..self.width).contains(&x) && (0..self.height).contains(&y) {
+                let index = y as usize * self.words_per_row + x as usize / 32;
+                self.bits[index] |= 1 << (x % 32);
             }
         }
         Ok(())
     }
 }
 
-impl OriginDimensions for Canvas<'_> {
+impl OriginDimensions for Mask {
     fn size(&self) -> Size {
         Size::new(WIDTH as u32, HEIGHT as u32)
     }
@@ -220,11 +204,13 @@ pub fn isqrt(value: i32) -> i32 {
     if value <= 0 {
         return 0;
     }
-    let mut root = value;
-    let mut next = (root + 1) / 2;
-    while next < root {
+    // A power of two above the root, so that Newton's method needs few steps.
+    let mut root = 1 << (32 - value.leading_zeros()).div_ceil(2);
+    loop {
+        let next = (root + value / root) / 2;
+        if next >= root {
+            return root;
+        }
         root = next;
-        next = (root + value / root) / 2;
     }
-    root
 }

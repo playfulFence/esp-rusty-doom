@@ -2,15 +2,8 @@
 //! moves and strafes, a stick on the right half turns, and buttons fire, use and
 //! switch weapons.
 
-use embedded_graphics::{
-    mono_font::{MonoTextStyle, ascii::FONT_10X20},
-    pixelcolor::Rgb565,
-    prelude::*,
-    text::{Alignment, Baseline, Text, TextStyleBuilder},
-};
-
 use crate::{
-    canvas::{Canvas, Paint, Rect, Shape, VIEW_Y, isqrt, rgb565},
+    canvas::{Mask, Paint, Shape, VIEW_Y, isqrt, rgb565},
     display::{HEIGHT, WIDTH},
     touch::Touches,
 };
@@ -124,16 +117,6 @@ impl Stick {
             },
         ]
     }
-
-    fn bounds(&self) -> Rect {
-        let reach = STICK_RADIUS + KNOB_RADIUS;
-        Rect {
-            x0: self.center.0 - reach,
-            y0: self.center.1 - reach,
-            x1: self.center.0 + reach + 1,
-            y1: self.center.1 + reach + 1,
-        }
-    }
 }
 
 struct Button {
@@ -186,15 +169,8 @@ impl Button {
         ]
     }
 
-    fn draw_label(&self, canvas: &mut Canvas<'_>) {
-        let (cx, cy) = self.center;
-        let style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-        let text_style = TextStyleBuilder::new()
-            .alignment(Alignment::Center)
-            .baseline(Baseline::Middle)
-            .build();
-        let _ =
-            Text::with_text_style(self.label, Point::new(cx, cy), style, text_style).draw(canvas);
+    fn label(&self) -> Mask {
+        Mask::text(self.label, self.center.0, self.center.1, WHITE)
     }
 }
 
@@ -290,20 +266,8 @@ impl Controls {
         [a, b, c, d, e, f, g, h, i, j]
     }
 
-    pub fn draw_labels(&self, canvas: &mut Canvas<'_>) {
-        self.fire.draw_label(canvas);
-        self.use_.draw_label(canvas);
-        self.weapon.draw_label(canvas);
-    }
-
-    /// The areas that the controls cover.
-    pub fn bounds(&self) -> [Rect; 5] {
-        [
-            self.walk.bounds(),
-            self.look.bounds(),
-            self.fire.shapes()[0].bounds(),
-            self.use_.shapes()[0].bounds(),
-            self.weapon.shapes()[0].bounds(),
-        ]
+    /// The buttons' labels. They never move.
+    pub fn labels(&self) -> [Mask; 3] {
+        [self.fire.label(), self.use_.label(), self.weapon.label()]
     }
 }

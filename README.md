@@ -56,3 +56,7 @@ The image is about 2 MB, so `cargo run` flashes at 921600 baud.
 - The bootloader sets up the Physical Memory Attributes (PMA) only on the first core. The second
   core copies them before it touches PSRAM, see `src/pma.rs`.
 - The renderer's depth buffer moves to internal RAM after loading. PSRAM is too slow for it.
+- There is no framebuffer. The LCD reads two 4-row bounce buffers in internal RAM, and an interrupt
+  on the first core draws the next rows into each one when the LCD finishes it: the game picture,
+  scaled 2x, with the controls and the text on top. When the LCD read a framebuffer in PSRAM, it
+  fell behind while both cores used PSRAM, and the picture shifted.

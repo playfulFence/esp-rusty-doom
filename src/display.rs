@@ -1,26 +1,22 @@
-//! The 800x480 RGB LCD of the Korvo-1 and the PSRAM framebuffer that it shows.
+//! The 800x480 RGB LCD of the Korvo-1, fed from internal RAM.
 //!
-//! The LCD's DMA reads the framebuffer through a circular descriptor chain, so the
-//! panel shows every change without a new transfer.
+//! PSRAM cannot feed the LCD while both cores use it: the DMA falls behind, and the
+//! picture shifts. So the LCD's DMA reads two small bounce buffers in internal RAM in
+//! a loop instead. When it finishes one, an interrupt draws the next rows into it, see
+//! [`scene::draw_rows`].
 
 use core::{
-    alloc::Layout,
-    ops::{Deref, DerefMut, Range},
+    ptr::addr_of_mut,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
-use allocator_api2::alloc::Allocator;
-use esp_alloc::DmaCompatibleExternalMemory;
+use embassy_time::Instant;
 use esp_hal::{
     Blocking,
-    dma::{
-        BurstConfig,
-        DmaDescriptor,
-        DmaTxBuffer,
-        Owner,
-        Preparation,
-        aligned::{DmaAlignedMut, InternalMemory},
-    },
+    dma::{BurstConfig, DmaDescriptor, DmaTxBuffer, Owner, Preparation},
     gpio::Level,
+    handler,
+    interrupt::{self, Priority},
     lcd_cam::{
         LcdCam,
         lcd::{
@@ -31,72 +27,147 @@ use esp_hal::{
             dpi::{Config, Dpi, DpiTransfer, Format, FrameTiming},
         },
     },
-    peripherals::AXI_GDMA,
+    peripherals::{AXI_GDMA, HP_SYS, Interrupt, LCD_CAM},
     time::Rate,
 };
 use static_cell::ConstStaticCell;
 
-use crate::LcdResources;
+use crate::{LcdResources, scene};
 
 pub const WIDTH: usize = 800;
 pub const HEIGHT: usize = 480;
-const FB_BYTES: usize = WIDTH * HEIGHT * 2;
 
-/// The largest multiple of the 64-byte PSRAM burst that fits in a descriptor. The
-/// AXI-GDMA must not split a burst across two descriptors.
-const CHUNK: usize = 4032;
-const CHUNKS: usize = FB_BYTES.div_ceil(CHUNK);
+/// Rows per bounce buffer. The interrupt has the time of this many rows to draw them.
+const BOUNCE_ROWS: usize = 4;
+const BOUNCE_PIXELS: usize = WIDTH * BOUNCE_ROWS;
+const CHUNKS_PER_FRAME: usize = HEIGHT / BOUNCE_ROWS;
+/// A bounce buffer is too big for one descriptor.
+const DESCRIPTORS_PER_BUFFER: usize = 2;
+const DESCRIPTOR_BYTES: usize = BOUNCE_PIXELS * 2 / DESCRIPTORS_PER_BUFFER;
 /// The channel of `DMA_AXI_CH0`.
 const LCD_CHANNEL: usize = 0;
 
-static DESCRIPTORS: ConstStaticCell<InternalMemory<[DmaDescriptor; CHUNKS]>> =
-    ConstStaticCell::new(InternalMemory::new([DmaDescriptor::EMPTY; CHUNKS]));
+#[repr(C, align(64))]
+struct BounceBuffers([[u16; BOUNCE_PIXELS]; 2]);
 
-/// The framebuffer that the panel shows, in little-endian RGB565.
+static mut BUFFERS: BounceBuffers = BounceBuffers([[0; BOUNCE_PIXELS]; 2]);
+static DESCRIPTORS: ConstStaticCell<[DmaDescriptor; 2 * DESCRIPTORS_PER_BUFFER]> =
+    ConstStaticCell::new([DmaDescriptor::EMPTY; 2 * DESCRIPTORS_PER_BUFFER]);
+
+/// The address of the last descriptor of the first bounce buffer.
+static FIRST_BUFFER_END: AtomicU32 = AtomicU32::new(0);
+/// The bounce buffer that the DMA finished last.
+static LAST_FINISHED: AtomicUsize = AtomicUsize::new(1);
+/// The chunk of rows that goes into the next finished bounce buffer.
+static NEXT_CHUNK: AtomicUsize = AtomicUsize::new(2);
+static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+static LATE_REFILLS: AtomicU32 = AtomicU32::new(0);
+static DRAW_MICROS: AtomicU32 = AtomicU32::new(0);
+
+/// The running LCD.
 pub struct Display {
-    transfer: DpiTransfer<'static, CircularFrameBuf, Blocking>,
+    _transfer: DpiTransfer<'static, BounceChain, Blocking>,
 }
 
 impl Display {
-    /// Starts showing a black framebuffer.
+    /// Starts showing what [`scene::draw_rows`] draws.
     pub fn new(r: LcdResources<'static>) -> Self {
-        let transfer = connect(r)
-            .send(true, CircularFrameBuf::new(allocate_framebuffer()))
-            .map_err(|error| error.0)
-            .unwrap();
+        let dpi = connect(r);
+        enable_trans_buffer();
+
+        let chain = BounceChain::new();
+        // SAFETY: the DMA does not run yet, and the interrupt is not bound yet.
+        unsafe {
+            let buffers = &mut *addr_of_mut!(BUFFERS);
+            scene::draw_rows(0, &mut buffers.0[0]);
+            scene::draw_rows(BOUNCE_ROWS, &mut buffers.0[1]);
+        }
+        interrupt::bind_handler(Interrupt::AXI_PDMA_OUT_CH0, refill);
+
+        let transfer = dpi.send(true, chain).map_err(|error| error.0).unwrap();
 
         let channel = AXI_GDMA::regs().out_ch(LCD_CHANNEL);
-        // The LCD's reads come before other PSRAM traffic, in 16-byte bursts.
         channel.out_pri().write(|w| unsafe { w.tx_pri().bits(6) });
         channel
             .out_conf0()
             .modify(|_, w| unsafe { w.out_burst_size_sel().bits(1) });
-        Self { transfer }
+        channel
+            .out_int()
+            .clr()
+            .write(|w| w.out_eof().clear_bit_by_one());
+        channel.out_int().ena().modify(|_, w| w.out_eof().set_bit());
+
+        Self {
+            _transfer: transfer,
+        }
     }
 
-    /// Makes the given framebuffer rows visible to the DMA.
-    pub fn writeback(&mut self, rows: Range<usize>) {
-        write_back_rows(self.transfer.frame, rows);
+    /// The frames with an underrun since the last call.
+    pub fn take_underruns(&self) -> u32 {
+        UNDERRUNS.swap(0, Ordering::Relaxed)
+    }
+
+    /// The bounce buffers that the DMA read before the interrupt refilled them, since
+    /// the last call.
+    pub fn take_late_refills(&self) -> u32 {
+        LATE_REFILLS.swap(0, Ordering::Relaxed)
+    }
+
+    /// The time that the interrupt spent drawing since the last call.
+    pub fn take_draw_micros(&self) -> u32 {
+        DRAW_MICROS.swap(0, Ordering::Relaxed)
     }
 }
 
-impl Deref for Display {
-    type Target = [u8];
+/// Draws the next rows into the bounce buffer that the DMA has just finished.
+#[handler(priority = Priority::max())]
+fn refill() {
+    let started = Instant::now();
+    let channel = AXI_GDMA::regs().out_ch(LCD_CHANNEL);
+    channel
+        .out_int()
+        .clr()
+        .write(|w| w.out_eof().clear_bit_by_one());
 
-    fn deref(&self) -> &Self::Target {
-        self.transfer.frame
+    let finished_end = channel.out_eof_des_addr().read().bits();
+    let finished = if finished_end == FIRST_BUFFER_END.load(Ordering::Relaxed) {
+        0
+    } else {
+        1
+    };
+    let mut chunk = NEXT_CHUNK.load(Ordering::Relaxed);
+    if finished == LAST_FINISHED.swap(finished, Ordering::Relaxed) {
+        // The interrupt was too late for the other buffer, and the DMA has read it
+        // with old rows. Skip its rows to stay in step with the panel.
+        chunk = (chunk + 1) % CHUNKS_PER_FRAME;
+        LATE_REFILLS.fetch_add(1, Ordering::Relaxed);
     }
-}
+    NEXT_CHUNK.store((chunk + 1) % CHUNKS_PER_FRAME, Ordering::Relaxed);
 
-impl DerefMut for Display {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.transfer.frame
+    if chunk == 0 {
+        let lcd_cam = LCD_CAM::regs();
+        if lcd_cam
+            .lc_dma_int_raw()
+            .read()
+            .lcd_underrun_int_raw()
+            .bit_is_set()
+        {
+            UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+            lcd_cam
+                .lc_dma_int_clr()
+                .write(|w| w.lcd_underrun_int_clr().set_bit());
+        }
     }
+
+    // SAFETY: the DMA reads the other buffer now, and only this interrupt writes here.
+    let buffer = unsafe { &mut (*addr_of_mut!(BUFFERS)).0[finished] };
+    scene::draw_rows(chunk * BOUNCE_ROWS, buffer);
+
+    DRAW_MICROS.fetch_add(started.elapsed().as_micros() as u32, Ordering::Relaxed);
 }
 
 /// Sets up the LCD for the board's panel: 14 MHz, 880x530 in total, 30 frames per
-/// second. The LCD reads PSRAM directly, and faster clocks underrun when other code
-/// uses PSRAM.
+/// second.
 fn connect(r: LcdResources<'static>) -> Dpi<'static, Blocking> {
     let config = Config::default()
         .with_format(Format {
@@ -150,59 +221,58 @@ fn connect(r: LcdResources<'static>) -> Dpi<'static, Blocking> {
         .with_data15(r.data15)
 }
 
-/// A black framebuffer in PSRAM, aligned for 64-byte DMA bursts.
-fn allocate_framebuffer() -> &'static mut [u8] {
-    let layout = Layout::from_size_align(FB_BYTES, 64).unwrap();
-    let mut allocation = DmaCompatibleExternalMemory
-        .allocate_zeroed(layout)
-        .expect("PSRAM framebuffer allocation failed");
-    unsafe { allocation.as_mut() }
+/// Turns on the LCD's transfer buffer, a memory block that holds more data than the
+/// FIFO, as ESP-IDF's RGB LCD driver does.
+fn enable_trans_buffer() {
+    HP_SYS::regs().lcdcam_mem_lp_ctrl().modify(|_, w| {
+        w.lcdcam_mem_lp_force_ctrl().clear_bit();
+        w.lcdcam_mem_lp_en().clear_bit()
+    });
+    let lcd_cam = LCD_CAM::regs();
+    lcd_cam
+        .lcd_trans_buff_cfg()
+        .write(|w| w.lcd_trans_buffer_ena().set_bit());
+    lcd_cam
+        .lcd_misc()
+        .modify(|_, w| w.lcd_afifo_reset().set_bit());
 }
 
-/// Writes the given framebuffer rows back from the data cache to PSRAM, where the
-/// DMA reads them.
-fn write_back_rows(frame: &mut [u8], rows: Range<usize>) {
-    if rows.is_empty() {
-        return;
-    }
-    let bytes = &mut frame[rows.start * WIDTH * 2..rows.end * WIDTH * 2];
-    DmaAlignedMut::new(bytes).unwrap().writeback();
+/// The two bounce buffers in a circular descriptor chain. The last descriptor of each
+/// buffer has EOF set, so that the DMA interrupts when it finishes the buffer.
+pub struct BounceChain {
+    descriptors: &'static mut [DmaDescriptor; 2 * DESCRIPTORS_PER_BUFFER],
 }
 
-pub struct CircularFrameBuf {
-    descriptors: DmaAlignedMut<'static, [DmaDescriptor]>,
-    frame: &'static mut [u8],
-}
-
-impl CircularFrameBuf {
-    fn new(frame: &'static mut [u8]) -> Self {
-        let mut descriptors = DESCRIPTORS.take().get_mut().unsize();
-        let base = frame.as_mut_ptr();
+impl BounceChain {
+    fn new() -> Self {
+        let descriptors = DESCRIPTORS.take();
         let first = descriptors.as_mut_ptr();
+        let buffers = addr_of_mut!(BUFFERS).cast::<u8>();
         for (i, descriptor) in descriptors.iter_mut().enumerate() {
-            let length = (FB_BYTES - i * CHUNK).min(CHUNK);
-            descriptor.set_size(length);
-            descriptor.set_length(length);
+            descriptor.set_size(DESCRIPTOR_BYTES);
+            descriptor.set_length(DESCRIPTOR_BYTES);
             descriptor.set_owner(Owner::Dma);
-            descriptor.set_suc_eof(false);
-            descriptor.buffer = base.wrapping_add(i * CHUNK);
-            descriptor.next = first.wrapping_add((i + 1) % CHUNKS);
+            descriptor.set_suc_eof(i % DESCRIPTORS_PER_BUFFER == DESCRIPTORS_PER_BUFFER - 1);
+            descriptor.buffer = buffers.wrapping_add(i * DESCRIPTOR_BYTES);
+            descriptor.next = first.wrapping_add((i + 1) % (2 * DESCRIPTORS_PER_BUFFER));
         }
-        Self { descriptors, frame }
+        FIRST_BUFFER_END.store(
+            first.wrapping_add(DESCRIPTORS_PER_BUFFER - 1) as u32,
+            Ordering::Relaxed,
+        );
+        Self { descriptors }
     }
 }
 
-// SAFETY: the descriptors are static, and the framebuffer is never freed.
-unsafe impl DmaTxBuffer for CircularFrameBuf {
+// SAFETY: the descriptors and the buffers are static.
+unsafe impl DmaTxBuffer for BounceChain {
     type View = Self;
     type Final = Self;
 
     fn prepare(&mut self) -> Preparation {
-        self.descriptors.writeback();
-        write_back_rows(self.frame, 0..HEIGHT);
         Preparation {
             start: self.descriptors.as_mut_ptr(),
-            accesses_psram: true,
+            accesses_psram: false,
             burst_transfer: BurstConfig::default(),
             check_owner: Some(false),
             auto_write_back: false,
