@@ -202,11 +202,12 @@ async fn main(_spawner: Spawner) -> ! {
         if elapsed >= Duration::from_secs(5) {
             fps = (frames as u64 * 1000 / elapsed.as_millis()) as u32;
             println!(
-                "{} fps, game {} ms per frame; drawing the panel takes {}% of this core; {} late refills, {} frames with LCD underruns",
+                "{} fps, game {} ms per frame; drawing the panel takes {}% of this core; {} late refills, {} resyncs, {} frames with LCD underruns",
                 fps,
                 game_time.as_millis() / frames as u64,
                 display.take_draw_micros() as u64 * 100 / elapsed.as_micros(),
                 display.take_late_refills(),
+                display.take_resyncs(),
                 display.take_underruns()
             );
             frames = 0;

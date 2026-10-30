@@ -10,6 +10,7 @@ use embedded_graphics::{
     prelude::*,
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
+use esp_hal::ram;
 use neurodoom::{SCREENHEIGHT, SCREENWIDTH};
 
 use crate::display::{HEIGHT, WIDTH};
@@ -23,6 +24,7 @@ pub const VIEW_X: usize = (WIDTH - VIEW_WIDTH) / 2;
 pub const VIEW_Y: usize = (HEIGHT - VIEW_HEIGHT) / 2;
 
 /// Draws one row of the game view, scaled up, with black on both sides.
+#[ram]
 pub fn draw_view_row(screen_row: &[u8], palette: &[u16; 256], row: &mut [u16]) {
     row[..VIEW_X].fill(0);
     row[VIEW_X + VIEW_WIDTH..].fill(0);
@@ -65,6 +67,7 @@ pub struct Shape {
 
 impl Shape {
     /// Paints the shape's part of panel row `y`.
+    #[ram]
     pub fn draw_row(&self, y: i32, row: &mut [u16]) {
         let dy = y - self.y;
         if dy.abs() > self.outer {
@@ -145,6 +148,7 @@ impl Mask {
     }
 
     /// Paints the mask's part of panel row `y`.
+    #[ram]
     pub fn draw_row(&self, y: i32, row: &mut [u16]) {
         let line = y - self.y;
         if !(0..self.height).contains(&line) {
@@ -200,6 +204,7 @@ fn half_mix(a: u16, b: u16) -> u16 {
     ((a & 0xf7de) >> 1) + ((b & 0xf7de) >> 1)
 }
 
+#[inline]
 pub fn isqrt(value: i32) -> i32 {
     if value <= 0 {
         return 0;

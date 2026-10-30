@@ -14,7 +14,7 @@ esp-alloc               = { version = "0.11.0", features = ["esp32s31"] }
 esp-backtrace           = { version = "0.20.0", features = ["esp32s31", "panic-handler", "println"] }
 esp-bootloader-esp-idf  = { version = "0.6.0", features = ["esp32s31"] }
 esp-hal                 = { version = "1.2.0", features = ["esp32s31", "log-04", "unstable"] }
-esp-println             = { version = "0.18.0", features = ["esp32s31", "log-04"] }
+esp-println             = { version = "0.18.0", default-features = false, features = ["colors", "esp32s31", "log-04", "uart"] }
 esp-rtos                = { version = "0.4.0", features = ["embassy", "esp32s31", "log-04"] }
 miniz_oxide             = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
 neurodoom               = { version = "0.6.7", default-features = false }

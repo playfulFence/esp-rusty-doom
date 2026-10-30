@@ -27,7 +27,8 @@ use esp_hal::{
             dpi::{Config, Dpi, DpiTransfer, Format, FrameTiming},
         },
     },
-    peripherals::{AXI_GDMA, HP_SYS, Interrupt, LCD_CAM},
+    peripherals::{AXI_GDMA, Interrupt, LCD_CAM},
+    ram,
     time::Rate,
 };
 use static_cell::ConstStaticCell;
@@ -62,6 +63,7 @@ static LAST_FINISHED: AtomicUsize = AtomicUsize::new(1);
 static NEXT_CHUNK: AtomicUsize = AtomicUsize::new(2);
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 static LATE_REFILLS: AtomicU32 = AtomicU32::new(0);
+static RESYNCS: AtomicU32 = AtomicU32::new(0);
 static DRAW_MICROS: AtomicU32 = AtomicU32::new(0);
 
 /// The running LCD.
@@ -73,7 +75,6 @@ impl Display {
     /// Starts showing what [`scene::draw_rows`] draws.
     pub fn new(r: LcdResources<'static>) -> Self {
         let dpi = connect(r);
-        enable_trans_buffer();
 
         let chain = BounceChain::new();
         // SAFETY: the DMA does not run yet, and the interrupt is not bound yet.
@@ -88,9 +89,13 @@ impl Display {
 
         let channel = AXI_GDMA::regs().out_ch(LCD_CHANNEL);
         channel.out_pri().write(|w| unsafe { w.tx_pri().bits(6) });
-        channel
-            .out_conf0()
-            .modify(|_, w| unsafe { w.out_burst_size_sel().bits(1) });
+        channel.out_conf0().modify(|_, w| {
+            // EOF when the DMA has read a buffer, as in ESP-IDF's RGB LCD driver. The
+            // reset value raises EOF when the data leaves the FIFO, and then the
+            // channel raises it only for every third bounce buffer.
+            w.out_eof_mode().clear_bit();
+            unsafe { w.out_burst_size_sel().bits(1) }
+        });
         channel
             .out_int()
             .clr()
@@ -113,6 +118,11 @@ impl Display {
         LATE_REFILLS.swap(0, Ordering::Relaxed)
     }
 
+    /// The frames that started out of step with the panel, since the last call.
+    pub fn take_resyncs(&self) -> u32 {
+        RESYNCS.swap(0, Ordering::Relaxed)
+    }
+
     /// The time that the interrupt spent drawing since the last call.
     pub fn take_draw_micros(&self) -> u32 {
         DRAW_MICROS.swap(0, Ordering::Relaxed)
@@ -121,6 +131,7 @@ impl Display {
 
 /// Draws the next rows into the bounce buffer that the DMA has just finished.
 #[handler(priority = Priority::max())]
+#[ram]
 fn refill() {
     let started = Instant::now();
     let channel = AXI_GDMA::regs().out_ch(LCD_CHANNEL);
@@ -142,22 +153,26 @@ fn refill() {
         chunk = (chunk + 1) % CHUNKS_PER_FRAME;
         LATE_REFILLS.fetch_add(1, Ordering::Relaxed);
     }
-    NEXT_CHUNK.store((chunk + 1) % CHUNKS_PER_FRAME, Ordering::Relaxed);
 
-    if chunk == 0 {
-        let lcd_cam = LCD_CAM::regs();
-        if lcd_cam
-            .lc_dma_int_raw()
-            .read()
-            .lcd_underrun_int_raw()
-            .bit_is_set()
-        {
-            UNDERRUNS.fetch_add(1, Ordering::Relaxed);
-            lcd_cam
-                .lc_dma_int_clr()
-                .write(|w| w.lcd_underrun_int_clr().set_bit());
+    let lcd_cam = LCD_CAM::regs();
+    let events = lcd_cam.lc_dma_int_raw().read();
+    if events.lcd_vsync_int_raw().bit_is_set() {
+        // The DMA stops in the vertical blank, inside the buffer with the first rows.
+        // So it has just finished those rows, and the next buffer gets the third
+        // chunk. This puts the rows back in step after a long interrupt delay.
+        if chunk != 2 {
+            RESYNCS.fetch_add(1, Ordering::Relaxed);
+            chunk = 2;
         }
+        if events.lcd_underrun_int_raw().bit_is_set() {
+            UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+        }
+        lcd_cam.lc_dma_int_clr().write(|w| {
+            w.lcd_vsync_int_clr().set_bit();
+            w.lcd_underrun_int_clr().set_bit()
+        });
     }
+    NEXT_CHUNK.store((chunk + 1) % CHUNKS_PER_FRAME, Ordering::Relaxed);
 
     // SAFETY: the DMA reads the other buffer now, and only this interrupt writes here.
     let buffer = unsafe { &mut (*addr_of_mut!(BUFFERS)).0[finished] };
@@ -219,22 +234,6 @@ fn connect(r: LcdResources<'static>) -> Dpi<'static, Blocking> {
         .with_data13(r.data13)
         .with_data14(r.data14)
         .with_data15(r.data15)
-}
-
-/// Turns on the LCD's transfer buffer, a memory block that holds more data than the
-/// FIFO, as ESP-IDF's RGB LCD driver does.
-fn enable_trans_buffer() {
-    HP_SYS::regs().lcdcam_mem_lp_ctrl().modify(|_, w| {
-        w.lcdcam_mem_lp_force_ctrl().clear_bit();
-        w.lcdcam_mem_lp_en().clear_bit()
-    });
-    let lcd_cam = LCD_CAM::regs();
-    lcd_cam
-        .lcd_trans_buff_cfg()
-        .write(|w| w.lcd_trans_buffer_ena().set_bit());
-    lcd_cam
-        .lcd_misc()
-        .modify(|_, w| w.lcd_afifo_reset().set_bit());
 }
 
 /// The two bounce buffers in a circular descriptor chain. The last descriptor of each

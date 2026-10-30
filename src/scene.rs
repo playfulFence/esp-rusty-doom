@@ -11,6 +11,7 @@ use core::{
     sync::atomic::{AtomicPtr, Ordering},
 };
 
+use esp_hal::ram;
 use neurodoom::SCREENWIDTH;
 
 use crate::{
@@ -95,6 +96,7 @@ pub fn take_done() -> Option<Box<Scene>> {
 
 /// Draws panel rows from `first_row` on into `rows`, row by row. Called by the
 /// scanout interrupt.
+#[ram]
 pub fn draw_rows(first_row: usize, rows: &mut [u16]) {
     if first_row == 0 {
         let next = NEXT.swap(ptr::null_mut(), Ordering::AcqRel);
